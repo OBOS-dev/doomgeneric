@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
+#include <termios.h>
 
 #include <sys/time.h>
 #include <sys/mman.h>
@@ -51,9 +52,17 @@ static struct fb_mode {
     uint8_t bpp; // See OBOS_FB_FORMAT_*
 } fb0_mode;
 
+void reset_tty()
+{ tcflow(STDIN_FILENO, TCOON); }
 // Assume /dev/ps2k1 is the keyboard.
 void DG_Init()
 {
+    if (isatty(STDIN_FILENO))
+    {
+        tcflow(STDIN_FILENO, TCOOFF);
+        atexit(reset_tty);
+    }
+
     keyboard_fd = open("/dev/ps2k1", O_RDONLY);
     if (keyboard_fd == -1)
     {
@@ -240,7 +249,7 @@ int DG_GetKey(int* pressed, unsigned char* key)
             *key = KEY_DEL;
             break;
         case SCANCODE_A ... SCANCODE_Z:
-            *key = 'A' + (scancode-SCANCODE_A);
+            *key = 'a' + (scancode-SCANCODE_A);
             break;
         case SCANCODE_SQUARE_BRACKET_LEFT:
             *key = (~mod & SHIFT) ? '[' : '{';

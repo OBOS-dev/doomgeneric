@@ -271,6 +271,7 @@ void I_Quit (void)
 
 static int ZenityAvailable(void)
 {
+    return 0;
     return system(ZENITY_BINARY " --help >/dev/null 2>&1") == 0;
 }
 
@@ -464,6 +465,9 @@ void I_Error (char *error, ...)
 #if ORIGCODE
     SDL_Quit();
 
+    exit(-1);
+#elif defined(__obos__)
+    //abort();
     exit(-1);
 #else
     while (true)
