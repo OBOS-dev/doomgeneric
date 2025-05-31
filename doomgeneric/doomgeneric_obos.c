@@ -53,13 +53,13 @@ static struct fb_mode {
 } fb0_mode;
 
 void reset_tty()
-{ tcflow(STDIN_FILENO, TCOON); }
+{ tcflow(STDIN_FILENO, TCION); }
 // Assume /dev/ps2k1 is the keyboard.
 void DG_Init()
 {
     if (isatty(STDIN_FILENO))
     {
-        tcflow(STDIN_FILENO, TCOOFF);
+        tcflow(STDIN_FILENO, TCIOFF);
         atexit(reset_tty);
     }
 
