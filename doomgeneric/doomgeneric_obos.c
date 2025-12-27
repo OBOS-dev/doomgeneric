@@ -53,8 +53,6 @@ syscall:;\
 
 bool obos_exit_event = false;
 
-static void initialize_sound();
-
 static int keyboard_fd = 0;
 static int audiodev = 0;
 static int fb0_fd = 0;
@@ -72,14 +70,11 @@ music_module_t DG_music_module;
 
 void reset_tty()
 { tcflow(STDIN_FILENO, TCION); }
-static void play_music_nolock(bool playing);
 void fatal_signal_handler(int sig)
 {
     (void)(sig);
     printf("Got fatal signal. Quitting DOOM.\n");
     reset_tty();
-    if (audiodev != -1)
-        play_music_nolock(false);
     if (sig == SIGINT || sig == SIGQUIT || sig == SIGTERM)
         obos_exit_event = true;
     else
@@ -138,8 +133,6 @@ void DG_Init()
     }
     printf("%s: Framebuffer is %dx%dx%d\n", __func__, fb0_mode.width, fb0_mode.height, fb0_mode.bpp);
     printf("%s: Mapped framebuffer at %p.\n", __func__, fb0);
-
-    initialize_sound();
 }
 
 void DG_DrawFrame()
@@ -329,389 +322,10 @@ void DG_SetWindowTitle(const char * title)
     (void)(title);
 }
 
-struct song_handle {
-    Sound_Sample* sample;
-    pthread_t decode_thread;
-    size_t offset;
-};
-
-#define MAX_PATHS 16
-struct {
-    stream_parameters stream_params;
-    uintptr_t path_hnd;
-    size_t stream_index;
-    int pipe_fds[2];
-    bool activated : 1;
-    bool playing : 1;
-} g_paths[MAX_PATHS] = {};
-pthread_mutex_t g_audiodev_mutex;
-pthread_t sound_thread = {};
-int g_music_path_index = -1;
-struct song_handle *volatile g_current_playing_song;
-bool g_loop_song;
-int use_libsamplerate = 0;
-float libsamplerate_scale = 0.f;
-
-bool initialized_sound = false;
-
-boolean Init(void) 
-{
-    if (audiodev == -1) return false;
-    assert(!initialized_sound);
-    Sound_Init();
-    return (initialized_sound = true);
-}
-
-void StopSong(void);
-void Shutdown(void)
-{
-    if (audiodev == -1) return;
-    if (initialized_sound)
-        return;
-    play_music_nolock(false);
-    StopSong();
-    Sound_Quit();
-    close(audiodev);
-    pthread_mutex_destroy(&g_audiodev_mutex);
-}
-
-void SetMusicVolume(int volume)
-{
-    if (audiodev == -1) return;
-    if (g_music_path_index == -1)
-        return;
-    if (volume > 100)
-        volume = 100;
-    if (volume < 0)
-        volume = 0;
-    struct hda_path_byte_parameter param = {.path=g_paths[g_music_path_index].path_hnd,.par1=volume};
-    pthread_mutex_lock(&g_audiodev_mutex);
-    ioctl(audiodev, IOCTL_HDA_PATH_VOLUME, &param);
-    pthread_mutex_unlock(&g_audiodev_mutex);
-}
-
-static void play_music_nolock(bool playing)
-{
-    if (audiodev == -1) return;
-    if (g_music_path_index == -1) return;
-    ioctl(audiodev, IOCTL_HDA_OUTPUT_STREAM_SELECT, &g_paths[g_music_path_index].stream_index);
-    ioctl(audiodev, IOCTL_HDA_STREAM_PLAY, &playing);
-    g_paths[g_music_path_index].playing = playing;
-}
-
-static void play_music(bool playing)
-{
-    if (audiodev == -1) return;
-    if (g_music_path_index == -1) return;
-    pthread_mutex_lock(&g_audiodev_mutex);
-    play_music_nolock(playing);
-    pthread_mutex_unlock(&g_audiodev_mutex);
-}
-
-void PauseMusic(void)
-{
-    play_music(false);
-}
-
-void ResumeMusic(void)
-{
-    play_music(true);
-}
-
-#define MAXMIDLENGTH (96 * 1024)
-#define MID_HEADER_MAGIC "MThd"
-#define MUS_HEADER_MAGIC "MUS\x1a"
-
-static boolean ConvertMus(byte *musdata, int len, void** outbuf, size_t* outbuf_len)
-{
-    MEMFILE *instream = mem_fopen_read(musdata, len);
-    MEMFILE *outstream = mem_fopen_write();
-
-    int result = mus2mid(instream, outstream);
-    if (result == 1)
-        return false;
-
-    void* buf = NULL;
-    size_t buflen = 0;
-    mem_get_buf(outstream, &buf, &buflen);
-    *outbuf = malloc(buflen);
-    memcpy(*outbuf, buf, buflen);
-    *outbuf_len = buflen;
-
-    mem_fclose(instream);
-    mem_fclose(outstream);
-
-    return true;
-}
-
-#include <SDL3_mixer/SDL_mixer.h>
-#include <SDL3/SDL.h>
-
-static size_t get_song_pipe_size()
-{
-    if (!g_current_playing_song)
-        return 512;
-    static uint8_t pcm_byte_table[] = {
-        1,2,2,3,4
-    };
-    return g_paths[g_music_path_index].stream_params.channels *
-           pcm_byte_table[g_paths[g_music_path_index].stream_params.format] * 
-           g_paths[g_music_path_index].stream_params.sample_rate;
-}
-
-#define SAMPLE_SIZE get_song_pipe_size()
-
-static void* decoder_thread(void* arg);
-
-void *RegisterSong(void *data, int len)
-{
-    if (audiodev == -1) return NULL;
-    void* buf = NULL;
-    size_t buflen = 0;
-    if (!ConvertMus(data, len, &buf, &buflen))
-        return NULL;
-
-    Sound_AudioInfo desired_fmt = {.format=SDL_AUDIO_S16LE,.channels=2,.rate=44100};
-    Sound_Sample* sample = Sound_NewSampleFromMem(
-        buf, buflen, 
-        ".mid", 
-        &desired_fmt, 
-        SAMPLE_SIZE);
-    if (!sample)
-    {
-        fprintf(stderr, "Sound_NewSampleFromMem returned error %s\n", Sound_GetError());
-        return NULL;
-    }
-
-    struct song_handle *hnd = malloc(sizeof(struct song_handle));
-    hnd->sample = sample;
-    pthread_create(&hnd->decode_thread, NULL, decoder_thread, hnd);
-    pthread_join(hnd->decode_thread, NULL);
-    return hnd;
-}
-
-void UnRegisterSong(void *handle)
-{
-    if (audiodev == -1) return;
-    struct song_handle *hnd = handle;
-    pthread_cancel(hnd->decode_thread);
-    pthread_join(hnd->decode_thread, NULL);
-    Sound_FreeSample(hnd->sample);
-    free(hnd);    
-}
-
-void PlaySong(void *handle, boolean looping)
-{
-    if (audiodev == -1) return;
-
-    looping = false;
-
-    // Make sure...
-    StopSong();
-
-    pthread_mutex_lock(&g_audiodev_mutex);
-    
-    struct song_handle *hnd = handle;
-    g_current_playing_song = hnd;
-    g_loop_song = looping;
-
-    struct hda_path_setup_parameters path_setup_req = {};
-    path_setup_req.path = g_paths[g_music_path_index].path_hnd;
-    path_setup_req.stream_parameters.channels = hnd->sample->actual.channels;
-    path_setup_req.stream_parameters.sample_rate = hnd->sample->actual.rate;
-    switch (hnd->sample->actual.format) {
-        case SDL_AUDIO_S8:
-            path_setup_req.stream_parameters.format = FORMAT_PCM8;
-            break;
-        case SDL_AUDIO_S16:
-            path_setup_req.stream_parameters.format = FORMAT_PCM16;
-            break;
-        case SDL_AUDIO_S32:
-            path_setup_req.stream_parameters.format = FORMAT_PCM32;
-            break;
-        default: 
-            pthread_mutex_unlock(&g_audiodev_mutex);
-            return; // bail
-    }
-    ioctl(audiodev, IOCTL_HDA_PATH_SETUP, &path_setup_req);
-    g_paths[g_music_path_index].stream_params = path_setup_req.stream_parameters;
-    
-    ioctl(audiodev, IOCTL_HDA_OUTPUT_STREAM_SELECT, &g_paths[g_music_path_index].stream_index);
-    
-    struct hda_stream_setup_user_parameters setup_params = {};
-    setup_params.ring_buffer_pipe = g_paths[g_music_path_index].pipe_fds[0];
-    setup_params.stream_params = g_paths[g_music_path_index].stream_params;
-    setup_params.ring_buffer_size = get_song_pipe_size();
-    ioctl(audiodev, IOCTL_HDA_STREAM_SETUP_USER, &setup_params);
-
-    // IOCTL_PIPE_SET_SIZE
-    size_t size = setup_params.ring_buffer_size;
-    ioctl(g_paths[g_music_path_index].pipe_fds[0], 1, &size);
-
-    Sound_SetBufferSize(g_current_playing_song->sample, get_song_pipe_size());
-
-    bool start = true;
-    ioctl(audiodev, IOCTL_HDA_STREAM_PLAY, &start);
-    g_paths[g_music_path_index].playing = start;
-
-    pthread_kill(sound_thread, SIGUSR1);
-
-    pthread_mutex_unlock(&g_audiodev_mutex);
-}
-
-void StopSong(void)
-{
-    if (audiodev == -1) return;
-
-    pthread_mutex_lock(&g_audiodev_mutex);
-    
-    ioctl(audiodev, IOCTL_HDA_OUTPUT_STREAM_SELECT, &g_paths[g_music_path_index].stream_index);
-    
-    bool stop = false;
-    ioctl(audiodev, IOCTL_HDA_STREAM_PLAY, &stop);
-    g_paths[g_music_path_index].playing = stop;
-    
-    ioctl(audiodev, IOCTL_HDA_STREAM_CLEAR_QUEUE, NULL);
-    ioctl(audiodev, IOCTL_HDA_STREAM_SHUTDOWN, NULL);
-    
-    ioctl(audiodev, IOCTL_HDA_PATH_SHUTDOWN, &g_paths[g_music_path_index].path_hnd);
-
-    g_loop_song = false;
-    g_current_playing_song = NULL;
-
-    pthread_kill(sound_thread, SIGUSR1);
-
-    pthread_mutex_unlock(&g_audiodev_mutex);
-}
-
-boolean MusicIsPlaying(void)
-{
-    if (audiodev == -1) return false;
-
-    if (g_music_path_index == -1) return false;
-    return g_paths[g_music_path_index].playing;
-}
-
-void Poll(void)
-{
-    if (audiodev == -1) return;
-    return;
-}
-
-static void music_tick()
-{
-    if (!g_current_playing_song)
-        return;
-    if (!g_loop_song || (~g_current_playing_song->sample->flags & SOUND_SAMPLEFLAG_EOF))
-    {
-        pthread_mutex_lock(&g_audiodev_mutex);
-        char* buffer = g_current_playing_song->sample->buffer;
-        buffer += g_current_playing_song->offset;
-        g_current_playing_song->offset += get_song_pipe_size();
-        pthread_mutex_unlock(&g_audiodev_mutex);
-        write(g_paths[g_music_path_index].pipe_fds[1], buffer, get_song_pipe_size());
-    }
-}
-
 static void sigusr1_handler(int sig)
 {
     (void)(sig);
     return;
-}
-
-void* sound_tick(void* unused)
-{
-    (void)(unused);
-    if (audiodev == -1)
-        return NULL;
-    uint32_t new_priority = 5;
-    syscall3(Sys_ThreadPriority, HANDLE_CURRENT, &new_priority, NULL);
-    signal(SIGUSR1, sigusr1_handler);
-    while (!obos_exit_event)
-    {
-        // pthread_mutex_lock(&g_audiodev_mutex);
-        if (g_current_playing_song)
-            music_tick();
-        // pthread_mutex_unlock(&g_audiodev_mutex);
-    }
-    return NULL;
-}
-
-static void* decoder_thread(void* arg)
-{
-    struct song_handle* hnd = arg;
-    int32_t duration = Sound_GetDuration(hnd->sample);
-    if (duration < 0)
-    {
-        printf("Sound_GetDuration returned error status\n");
-        return NULL;
-    }
-    if (duration == 0)
-    {
-        printf("Sound_GetDuration unexpectedly returned zero\n");
-        return NULL;
-    }
-    size_t size = 0;
-    static uint8_t pcm_byte_table[] = {
-        1,2,2,3,4
-    };
-    size = g_paths[g_music_path_index].stream_params.channels *
-           pcm_byte_table[g_paths[g_music_path_index].stream_params.format] * 
-           g_paths[g_music_path_index].stream_params.sample_rate;
-    size *= duration;
-    Sound_SetBufferSize(hnd->sample, size);
-    Sound_DecodeAll(hnd->sample);
-    return NULL;
-}
-
-static void initialize_sound()
-{
-    pthread_mutex_init(&g_audiodev_mutex, NULL);
-
-    DG_music_module.Init = Init;
-    DG_music_module.Shutdown = Shutdown;
-    DG_music_module.SetMusicVolume = SetMusicVolume;
-    DG_music_module.PauseMusic = PauseMusic;
-    DG_music_module.ResumeMusic = ResumeMusic;
-    DG_music_module.RegisterSong = RegisterSong;
-    DG_music_module.UnRegisterSong = UnRegisterSong;
-    DG_music_module.PlaySong = PlaySong;
-    DG_music_module.StopSong = StopSong;
-    DG_music_module.MusicIsPlaying = MusicIsPlaying;
-    DG_music_module.Poll = Poll;
-
-    if (audiodev == -1)
-        return;
-
-    size_t index = 0;
-    ioctl(audiodev, IOCTL_HDA_CODEC_SELECT, &index);
-    ioctl(audiodev, IOCTL_HDA_OUTPUT_STREAM_SELECT, &index);
-    ioctl(audiodev, IOCTL_HDA_CODEC_SELECT_OUTPUT_GROUP, &index);
-    ioctl(audiodev, IOCTL_HDA_OUTPUT_GROUP_SELECT_OUTPUT, &index);
-
-    snddevice_t* music_devices = calloc(1, sizeof(snddevice_t));
-    music_devices[0] = SNDDEVICE_PCSPEAKER;
-    DG_music_module.sound_devices = music_devices;
-    DG_music_module.num_sound_devices = 1;
-
-    g_music_path_index = 0;
-    struct hda_path_find_parameters path_find_req = {};
-    path_find_req.same_stream = false;
-    path_find_req.other_path_count = 0;
-    ioctl(audiodev, IOCTL_HDA_PATH_FIND, &path_find_req);
-    g_paths[g_music_path_index].path_hnd = path_find_req.found_path;
-    ioctl(audiodev, IOCTL_HDA_OUTPUT_GROUP_SELECTED_OUTPUT, &g_paths[g_music_path_index].stream_index);
-    syscall2(Sys_CreatePipe, g_paths[g_music_path_index].pipe_fds, SAMPLE_SIZE);
-    g_paths[g_music_path_index].activated = true;
-
-    atexit(Shutdown);
-
-    int err = 0;
-    if ((err = pthread_create(&sound_thread, NULL, sound_tick, NULL)) > 0)
-    {
-        fprintf(stderr, "pthread_create: %s\n", strerror(err));
-        exit(-1);
-    }
 }
 
 #include <pthread.h>
@@ -722,8 +336,6 @@ int main (int argc, char** argv)
 
     while (!obos_exit_event)
         doomgeneric_Tick();
-
-    pthread_join(sound_thread, NULL);
 
     return 0;
 }
