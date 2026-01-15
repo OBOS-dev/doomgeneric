@@ -144,7 +144,26 @@ void DG_DrawFrame()
     }
 }
 
-size_t i = 0;
+#ifdef __x86_64__
+void DG_SleepMs(uint32_t ms)
+{
+    uint32_t deadline = DG_GetTicksMs() + ms;
+    while (deadline > DG_GetTicksMs())
+        __builtin_ia32_pause();
+//  syscall2(Sys_SleepMS, ms, NULL);
+    //i++;
+}
+
+uint32_t DG_GetTicksMs()
+{
+    static uint64_t tsc_freq = 0;
+    if (!tsc_freq)
+        tsc_freq = syscall0(0x80000006);
+    uint64_t tsc = __builtin_ia32_rdtsc();
+    return tsc / (tsc_freq / 1000);
+}
+#else
+static uint32_t i = 0;
 void DG_SleepMs(uint32_t ms)
 {
     syscall2(Sys_SleepMS, ms, NULL);
@@ -152,12 +171,8 @@ void DG_SleepMs(uint32_t ms)
 }
 
 uint32_t DG_GetTicksMs()
-{
-    return (uint32_t)i;
-    struct timeval tv = {};
-    gettimeofday(&tv, NULL);
-    return tv.tv_usec/1000;
-}
+{ return i; }
+#endif
 
 unsigned char numpad_to_key(uint8_t scancode)
 {
